@@ -49,7 +49,6 @@ This setup provides a scalable n8n infrastructure with:
 ```bash
 docker network create traefik
 docker network create n8n
-docker network create dns  # Optional, for custom DNS
 ```
 
 ### Required External Volume
@@ -64,7 +63,7 @@ docker volume create n8nRedis
 
 ```bash
 git clone <repository-url>
-cd n8n-docker-compose
+cd docker-compose
 ```
 
 ### 2. Create Environment File
@@ -80,7 +79,7 @@ SUB=n8n
 DNS_SERVER=8.8.8.8
 
 # Timezone
-TIMEZONE=UTC
+TIMEZONE=Asia/Jerusalem
 
 # Database Configuration
 PG_HOST=your-postgres-host
@@ -184,7 +183,7 @@ N8N_LOG_FILE_MAXCOUNT=30    # Keep 30 files
 ### Traefik Labels
 
 The setup assumes Traefik is configured with:
-- Middleware `secured@file`: Authentication for main UI
+- Middleware `secured@file`: Limit access for main UI
 - Middleware `default-headers@file`: Security headers
 - Middleware `headers-authentik@file`: Authentik authentication (for RedisInsight)
 
