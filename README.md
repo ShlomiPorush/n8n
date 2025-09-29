@@ -250,10 +250,6 @@ LOG_LEVEL="INFO"  # Options: DEBUG, INFO, WARNING, ERROR
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## License
-
-[Specify your license here]
-
 ## Support
 
 For issues and questions, please open an issue on GitHub.
