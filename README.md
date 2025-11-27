@@ -213,7 +213,7 @@ crontab -e
 
 Add:
 ```
-0 2 * * * /path/to/backup.sh >> /path/to/backup.log 2>&1
+0 2 * * * /path/to/backup.sh
 ```
 
 For password-protected backups with cron, set:
