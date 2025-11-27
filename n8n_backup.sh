@@ -31,7 +31,7 @@ LOGS_DIR="${BASE_DIR}/logs"
 # Encryption settings
 ENABLE_ENCRYPTION=true  # Set to false to skip encryption
 PROMPT_FOR_PASSWORD=true  # Set to false to use DEFAULT_PASSWORD
-DEFAULT_PASSWORD=""  # Only used if PROMPT_FOR_PASSWORD=false - CHANGE THIS!
+DEFAULT_PASSWORD=""  # Only used if PROMPT_FOR_PASSWORD=false
 
 # Export paths inside containers (temporary paths inside container, no mount required)
 CONTAINER_WORKFLOWS_PATH="/tmp/n8n_backup/workflows/"
@@ -43,6 +43,20 @@ DOCKER_USER="node"
 # Log configuration
 LOG_LEVEL="INFO"  # DEBUG, INFO, WARNING, ERROR
 
+# Email configuration
+ENABLE_EMAIL=false  # Set to false to skip email notification
+EMAIL_TO="your-email@example.com"
+EMAIL_FROM="backup@example.com"
+EMAIL_SUBJECT_BASE="n8n Backup Report"
+SMTP_SERVER="smtp.example.com"
+SMTP_PORT="587"
+SMTP_USER="your-smtp-user"
+SMTP_PASSWORD="your-smtp-password"
+
+# Webhook configuration
+ENABLE_WEBHOOK=false  # Set to false to skip webhook notification
+WEBHOOK_URL="https://your-webhook-url.com/endpoint"
+
 #==============================================================================
 # END USER CONFIGURATION
 #==============================================================================
@@ -50,6 +64,12 @@ LOG_LEVEL="INFO"  # DEBUG, INFO, WARNING, ERROR
 # System configuration (usually no need to change)
 LOG_FILE="${LOGS_DIR}/n8n_backup_$(date +%Y%m%d_%H%M%S).log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+# Declare associative arrays for tracking container results
+declare -A CONTAINER_WORKFLOWS_STATUS
+declare -A CONTAINER_WORKFLOWS_COUNT
+declare -A CONTAINER_CREDENTIALS_STATUS
+declare -A CONTAINER_CREDENTIALS_COUNT
 
 # Function to write logs
 log_message() {
@@ -85,6 +105,13 @@ check_container_exists() {
     return 0
 }
 
+# Function to extract count from export output
+extract_count() {
+    local output="$1"
+    local count=$(echo "$output" | grep -oP 'Successfully exported \K\d+' | head -1)
+    echo "${count:-0}"
+}
+
 # Function to export workflows
 export_workflows() {
     local container_name="$1"
@@ -95,18 +122,29 @@ export_workflows() {
     # Create temp dir inside container
     docker exec -u "$DOCKER_USER" "$container_name" mkdir -p "$CONTAINER_WORKFLOWS_PATH"
     
-    if docker exec -u "$DOCKER_USER" "$container_name" n8n export:workflow --backup --output="$CONTAINER_WORKFLOWS_PATH" 2>&1 | tee -a "$LOG_FILE"; then
+    local export_output
+    export_output=$(docker exec -u "$DOCKER_USER" "$container_name" n8n export:workflow --backup --output="$CONTAINER_WORKFLOWS_PATH" 2>&1)
+    echo "$export_output" | tee -a "$LOG_FILE"
+    
+    local export_status=$?
+    local count=$(extract_count "$export_output")
+    CONTAINER_WORKFLOWS_COUNT["$container_name"]=$count
+    
+    if [ $export_status -eq 0 ]; then
         # Copy files to host
         if docker cp "$container_name:$CONTAINER_WORKFLOWS_PATH/." "$host_workflows_dir/" 2>&1 | tee -a "$LOG_FILE"; then
+            CONTAINER_WORKFLOWS_STATUS["$container_name"]="SUCCESS"
             log_message "SUCCESS" "Workflows export and copy completed successfully for $container_name"
             # Clean up inside container
             docker exec -u "$DOCKER_USER" "$container_name" rm -rf "$CONTAINER_WORKFLOWS_PATH" || true
             return 0
         else
+            CONTAINER_WORKFLOWS_STATUS["$container_name"]="FAILED"
             log_message "ERROR" "Workflows copy failed for $container_name"
             return 1
         fi
     else
+        CONTAINER_WORKFLOWS_STATUS["$container_name"]="FAILED"
         log_message "ERROR" "Workflows export failed for $container_name"
         return 1
     fi
@@ -122,18 +160,29 @@ export_credentials() {
     # Create temp dir inside container
     docker exec -u "$DOCKER_USER" "$container_name" mkdir -p "$CONTAINER_CREDENTIALS_PATH"
     
-    if docker exec -u "$DOCKER_USER" "$container_name" n8n export:credentials --backup --decrypted --output="$CONTAINER_CREDENTIALS_PATH" 2>&1 | tee -a "$LOG_FILE"; then
+    local export_output
+    export_output=$(docker exec -u "$DOCKER_USER" "$container_name" n8n export:credentials --backup --decrypted --output="$CONTAINER_CREDENTIALS_PATH" 2>&1)
+    echo "$export_output" | tee -a "$LOG_FILE"
+    
+    local export_status=$?
+    local count=$(extract_count "$export_output")
+    CONTAINER_CREDENTIALS_COUNT["$container_name"]=$count
+    
+    if [ $export_status -eq 0 ]; then
         # Copy files to host
         if docker cp "$container_name:$CONTAINER_CREDENTIALS_PATH/." "$host_credentials_dir/" 2>&1 | tee -a "$LOG_FILE"; then
+            CONTAINER_CREDENTIALS_STATUS["$container_name"]="SUCCESS"
             log_message "SUCCESS" "Credentials export and copy completed successfully for $container_name"
             # Clean up inside container
             docker exec -u "$DOCKER_USER" "$container_name" rm -rf "$CONTAINER_CREDENTIALS_PATH" || true
             return 0
         else
+            CONTAINER_CREDENTIALS_STATUS["$container_name"]="FAILED"
             log_message "ERROR" "Credentials copy failed for $container_name"
             return 1
         fi
     else
+        CONTAINER_CREDENTIALS_STATUS["$container_name"]="FAILED"
         log_message "ERROR" "Credentials export failed for $container_name"
         return 1
     fi
@@ -213,6 +262,204 @@ find_n8n_containers() {
     printf '%s\n' "${containers[@]}"
 }
 
+# Function to generate HTML email table
+generate_email_html() {
+    local containers=("$@")
+    local html_body=""
+    
+    html_body+='<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: auto; max-width: 800px; margin: 20px 0; font-size: 14px; }
+        th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; white-space: nowrap; }
+        th { background-color: #4CAF50; color: white; font-weight: bold; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        tr:hover { background-color: #f5f5f5; }
+        .success { color: green; font-weight: bold; }
+        .failed { color: red; font-weight: bold; }
+        .skipped { color: orange; font-weight: bold; }
+        .info { margin: 10px 0; font-size: 14px; }
+        h2 { color: #333; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <h2>n8n Backup Report</h2>
+    <p class="info"><strong>Date:</strong> '"$(date '+%Y-%m-%d %H:%M:%S')"'</p>
+    <p class="info"><strong>Total Containers:</strong> '"${#containers[@]}"'</p>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>Container Name</th>
+                <th>Workflows Status</th>
+                <th>Credentials Status</th>
+            </tr>
+        </thead>
+        <tbody>'
+    
+    for container in "${containers[@]}"; do
+        local wf_status="${CONTAINER_WORKFLOWS_STATUS[$container]:-N/A}"
+        local wf_count="${CONTAINER_WORKFLOWS_COUNT[$container]:-0}"
+        local cred_status="${CONTAINER_CREDENTIALS_STATUS[$container]:-N/A}"
+        local cred_count="${CONTAINER_CREDENTIALS_COUNT[$container]:-0}"
+        
+        local wf_class="success"
+        local cred_class="success"
+        
+        [ "$wf_status" = "FAILED" ] && wf_class="failed"
+        [ "$wf_status" = "SKIPPED" ] && wf_class="skipped"
+        [ "$cred_status" = "FAILED" ] && cred_class="failed"
+        [ "$cred_status" = "SKIPPED" ] && cred_class="skipped"
+        
+        html_body+='
+            <tr>
+                <td>'"$container"'</td>
+                <td class="'"$wf_class"'">'"$wf_status"' ('"$wf_count"')</td>
+                <td class="'"$cred_class"'">'"$cred_status"' ('"$cred_count"')</td>
+            </tr>'
+    done
+    
+    html_body+='
+        </tbody>
+    </table>
+</body>
+</html>'
+    
+    echo "$html_body"
+}
+
+# Function to determine overall backup status
+determine_backup_status() {
+    local total_containers=$1
+    local success_count=$2
+    local failed_count=0
+    
+    for container in "${!CONTAINER_WORKFLOWS_STATUS[@]}"; do
+        local wf_status="${CONTAINER_WORKFLOWS_STATUS[$container]:-N/A}"
+        local cred_status="${CONTAINER_CREDENTIALS_STATUS[$container]:-N/A}"
+        
+        if [ "$wf_status" = "FAILED" ] || [ "$cred_status" = "FAILED" ]; then
+            failed_count=$((failed_count + 1))
+        fi
+    done
+    
+    if [ $success_count -eq $total_containers ] && [ $failed_count -eq 0 ]; then
+        echo "SUCCESS"
+    elif [ $success_count -eq 0 ]; then
+        echo "ERROR"
+    else
+        echo "WARNING"
+    fi
+}
+
+# Function to send email notification
+send_email_notification() {
+    local containers=("$@")
+    local total_containers=${#containers[@]}
+    local success_count=0
+    
+    if [ "$ENABLE_EMAIL" != true ]; then
+        log_message "INFO" "Email notification disabled"
+        return 0
+    fi
+    
+    log_message "INFO" "Preparing email notification"
+    
+    # Count successful containers
+    for container in "${containers[@]}"; do
+        local wf_status="${CONTAINER_WORKFLOWS_STATUS[$container]:-N/A}"
+        local cred_status="${CONTAINER_CREDENTIALS_STATUS[$container]:-N/A}"
+        
+        if [ "$wf_status" = "SUCCESS" ] && [ "$cred_status" = "SUCCESS" ]; then
+            success_count=$((success_count + 1))
+        fi
+    done
+    
+    # Determine overall status
+    local overall_status=$(determine_backup_status $total_containers $success_count)
+    local email_subject="[${overall_status}] ${EMAIL_SUBJECT_BASE} - $(date +%Y-%m-%d)"
+    
+    log_message "INFO" "Email subject: $email_subject"
+    
+    local email_html=$(generate_email_html "${containers[@]}")
+    local email_file="/tmp/n8n_backup_email_$.html"
+    echo "$email_html" > "$email_file"
+    
+    # Send email using curl with SMTP
+    if command -v curl >/dev/null 2>&1; then
+        log_message "INFO" "Sending email via SMTP using curl (Status: ${overall_status})"
+        
+        # Create email message
+        local email_message="From: $EMAIL_FROM
+To: $EMAIL_TO
+Subject: $email_subject
+Content-Type: text/html; charset=UTF-8
+
+$email_html"
+        
+        echo "$email_message" | curl --ssl-reqd \
+            --url "smtp://${SMTP_SERVER}:${SMTP_PORT}" \
+            --user "${SMTP_USER}:${SMTP_PASSWORD}" \
+            --mail-from "$EMAIL_FROM" \
+            --mail-rcpt "$EMAIL_TO" \
+            --upload-file - 2>&1 | tee -a "$LOG_FILE" || {
+            log_message "ERROR" "Failed to send email via curl"
+        }
+        
+        if [ $? -eq 0 ]; then
+            log_message "SUCCESS" "Email sent successfully to $EMAIL_TO"
+        else
+            log_message "ERROR" "Failed to send email"
+        fi
+    else
+        log_message "WARNING" "curl not found, cannot send email"
+    fi
+    
+    rm -f "$email_file"
+    return 0
+}
+
+# Function to send webhook notification
+send_webhook_notification() {
+    local backup_filename="$1"
+    
+    if [ "$ENABLE_WEBHOOK" != true ]; then
+        log_message "INFO" "Webhook notification disabled"
+        return 0
+    fi
+    
+    log_message "INFO" "Sending webhook notification"
+    
+    if command -v curl >/dev/null 2>&1; then
+        local json_payload=$(cat <<EOF
+{
+    "backup_file": "$(basename "$backup_filename")",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')",
+    "status": "completed"
+}
+EOF
+)
+        
+        curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$json_payload" 2>&1 | tee -a "$LOG_FILE" || {
+            log_message "ERROR" "Failed to send webhook"
+        }
+        
+        if [ $? -eq 0 ]; then
+            log_message "SUCCESS" "Webhook notification sent successfully"
+        else
+            log_message "ERROR" "Failed to send webhook notification"
+        fi
+    else
+        log_message "WARNING" "curl not found, cannot send webhook"
+    fi
+    
+    return 0
+}
+
 # Main function
 main() {
     # Create required directories
@@ -253,6 +500,10 @@ main() {
         
         if ! check_container_exists "$container"; then
             log_message "ERROR" "Skipping container: $container"
+            CONTAINER_WORKFLOWS_STATUS["$container"]="SKIPPED"
+            CONTAINER_WORKFLOWS_COUNT["$container"]=0
+            CONTAINER_CREDENTIALS_STATUS["$container"]="SKIPPED"
+            CONTAINER_CREDENTIALS_COUNT["$container"]=0
             continue
         fi
         
@@ -275,7 +526,9 @@ main() {
         fi
         
         if $container_success; then
+            echo "Before increment: success_count is '$success_count'"
             success_count=$((success_count + 1))
+            echo "After increment: success_count is now '$success_count'"
             log_message "SUCCESS" "Backup completed successfully for container: $container"
         else
             log_message "ERROR" "Backup failed for container: $container"
@@ -348,6 +601,20 @@ main() {
 
     # Clear backup files/
     rm -rf "$FILES_DIR"/* 2>/dev/null || true
+    
+    # ============================================================================
+    # EMAIL AND WEBHOOK NOTIFICATIONS - Added functionality
+    # ============================================================================
+    
+    log_separator "Sending Notifications"
+    
+    # Send email notification with backup report
+    send_email_notification "${containers[@]}"
+    
+    # Send webhook notification with backup file info
+    send_webhook_notification "$zip_filename"
+    
+    log_message "INFO" "All notifications completed"
 }
 
 # Execute main function
