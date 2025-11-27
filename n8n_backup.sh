@@ -45,8 +45,10 @@ LOG_LEVEL="INFO"  # DEBUG, INFO, WARNING, ERROR
 
 # Email configuration
 ENABLE_EMAIL=false  # Set to false to skip email notification
+# Use semicolon (;) or comma (,) to separate multiple email addresses
 EMAIL_TO="your-email@example.com"
 EMAIL_FROM="backup@example.com"
+EMAIL_FROM_NAME="n8n Backup"
 EMAIL_SUBJECT_BASE="n8n Backup Report"
 SMTP_SERVER="smtp.example.com"
 SMTP_PORT="587"
@@ -354,6 +356,13 @@ determine_backup_status() {
     fi
 }
 
+# Function to parse email addresses from string
+parse_email_addresses() {
+    local email_string="$1"
+    # Replace semicolons with spaces, then split by comma or space
+    echo "$email_string" | tr ';,' ' ' | tr -s ' ' | xargs -n1 | grep -v '^$'
+}
+
 # Function to send email notification
 send_email_notification() {
     local containers=("$@")
@@ -384,40 +393,72 @@ send_email_notification() {
     log_message "INFO" "Email subject: $email_subject"
     
     local email_html=$(generate_email_html "${containers[@]}")
-    local email_file="/tmp/n8n_backup_email_$.html"
-    echo "$email_html" > "$email_file"
+    
+    # Parse email addresses
+    local email_addresses=()
+    while IFS= read -r email; do
+        if [ -n "$email" ]; then
+            email_addresses+=("$email")
+        fi
+    done < <(parse_email_addresses "$EMAIL_TO")
+    
+    if [ ${#email_addresses[@]} -eq 0 ]; then
+        log_message "ERROR" "No valid email addresses found"
+        return 1
+    fi
+    
+    log_message "INFO" "Sending to ${#email_addresses[@]} recipient(s): ${email_addresses[*]}"
     
     # Send email using curl with SMTP
     if command -v curl >/dev/null 2>&1; then
         log_message "INFO" "Sending email via SMTP using curl (Status: ${overall_status})"
         
-        # Create email message
-        local email_message="From: $EMAIL_FROM
-To: $EMAIL_TO
+        # Build mail-rcpt parameters for each recipient
+        local rcpt_params=""
+        for email in "${email_addresses[@]}"; do
+            rcpt_params+=" --mail-rcpt \"$email\""
+        done
+        
+        # Create email message with all recipients in To: header
+        local to_header=$(IFS=,; echo "${email_addresses[*]}")
+        local email_message="From: $EMAIL_FROM_NAME <$EMAIL_FROM>
+To: $to_header
 Subject: $email_subject
 Content-Type: text/html; charset=UTF-8
 
 $email_html"
         
-        echo "$email_message" | curl --ssl-reqd \
-            --url "smtp://${SMTP_SERVER}:${SMTP_PORT}" \
-            --user "${SMTP_USER}:${SMTP_PASSWORD}" \
-            --mail-from "$EMAIL_FROM" \
-            --mail-rcpt "$EMAIL_TO" \
-            --upload-file - 2>&1 | tee -a "$LOG_FILE" || {
-            log_message "ERROR" "Failed to send email via curl"
-        }
+        # Create temp file for the message
+        local temp_msg="/tmp/n8n_backup_email_$$.txt"
+        echo "$email_message" > "$temp_msg"
         
-        if [ $? -eq 0 ]; then
-            log_message "SUCCESS" "Email sent successfully to $EMAIL_TO"
+        # Build and execute curl command
+        local curl_cmd="curl --ssl-reqd --url \"smtp://${SMTP_SERVER}:${SMTP_PORT}\" --user \"${SMTP_USER}:${SMTP_PASSWORD}\" --mail-from \"$EMAIL_FROM\""
+        
+        for email in "${email_addresses[@]}"; do
+            curl_cmd+=" --mail-rcpt \"$email\""
+        done
+        
+        curl_cmd+=" --upload-file \"$temp_msg\""
+        
+        # Execute the command
+        eval "$curl_cmd" 2>&1 | tee -a "$LOG_FILE"
+        local curl_status=$?
+        
+        # Clean up temp file
+        rm -f "$temp_msg"
+        
+        if [ $curl_status -eq 0 ]; then
+            log_message "SUCCESS" "Email sent successfully to: ${email_addresses[*]}"
         else
-            log_message "ERROR" "Failed to send email"
+            log_message "ERROR" "Failed to send email (curl exit code: $curl_status)"
+            return 1
         fi
     else
         log_message "WARNING" "curl not found, cannot send email"
+        return 1
     fi
     
-    rm -f "$email_file"
     return 0
 }
 
